@@ -897,6 +897,7 @@ cc_library(
         ":logging",
         ":rusage_profiler",
         ":shard_reader",
+        ":thread_pool",
         ":util",
         ":workdir",
         "@com_google_absl//absl/log",
@@ -1235,6 +1236,7 @@ cc_test(
     deps = [
         ":remote_file",
         ":test_util",
+        "@com_google_absl//absl/log:check",
         "@com_google_googletest//:gtest_main",
     ],
 )
