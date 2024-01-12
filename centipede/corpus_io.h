@@ -40,6 +40,14 @@ namespace centipede {
 // then callback's 2nd argument is {feature_domains::kNoFeature}.
 void ReadShard(
     std::string_view corpus_path, std::string_view features_path,
+    const std::function<void(ByteArray &&, FeatureVec &&)> &callback);
+
+// A legacy version of the above. Passes differently CV-qualified parameters to
+// `callback`. Prefer the other version for better peak memory performance (its
+// `callback` can move both arguments into the destination).
+// TODO(ussuri): Port all call sites to the other version and remove this one.
+void ReadShard(
+    std::string_view corpus_path, std::string_view features_path,
     const std::function<void(const ByteArray &, FeatureVec &)> &callback);
 
 }  // namespace centipede
