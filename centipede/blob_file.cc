@@ -14,19 +14,26 @@
 
 #include "./centipede/blob_file.h"
 
+#include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <vector>
 
 #include "absl/log/check.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
 #include "./centipede/defs.h"
 #include "./centipede/logging.h"
 #include "./centipede/remote_file.h"
 #include "./centipede/util.h"
+#include "riegeli/base/types.h"
 #ifndef CENTIPEDE_DISABLE_RIEGELI
 #include "riegeli/base/object.h"
 #include "riegeli/bytes/reader.h"
@@ -36,6 +43,7 @@
 #endif  // CENTIPEDE_DISABLE_RIEGELI
 
 namespace centipede {
+namespace {
 
 // TODO(ussuri): Return more informative statuses, at least with the file path
 //  included. That will require adjustments in the test: use
@@ -125,7 +133,6 @@ class SimpleBlobFileWriter : public BlobFileWriter {
     ByteArray bytes(blob.begin(), blob.end());
     ByteArray packed = PackBytesForAppendFile(bytes);
     RemoteFileAppend(file_, packed);
-
     return absl::OkStatus();
   }
 
@@ -245,6 +252,7 @@ class DefaultBlobFileReader : public BlobFileReader {
 class RiegeliWriter : public BlobFileWriter {
  public:
   ~RiegeliWriter() override {
+    VLOG(1) << "Final stats: " << StatsString();
     // Virtual resolution is off in dtors, so use a specific Close().
     CHECK_OK(RiegeliWriter::Close());
   }
@@ -252,25 +260,27 @@ class RiegeliWriter : public BlobFileWriter {
   absl::Status Open(std::string_view path, std::string_view mode) override {
     CHECK(mode == "w" || mode == "a") << VV(mode);
     if (absl::Status s = Close(); !s.ok()) return s;
-    writer_.Reset(CreateRiegeliFileWriter(path, mode == "a"));
+    file_path_ = path;
+    open_time_ = absl::Now();
+    flush_time_ = absl::Now();
+    buffered_blobs_ = 0;
+    buffered_bytes_ = 0;
+    written_bytes_ = 0;
+    const auto kWriterOpts =  //
+        riegeli::RecordWriterBase::Options{}
+            .set_chunk_size(kMaxBufferedBytes)
+            .set_parallelism(kCompressionParallelism);
+    writer_.Reset(CreateRiegeliFileWriter(path, mode == "a"), kWriterOpts);
     if (!writer_.ok()) return writer_.status();
     return absl::OkStatus();
   }
 
   absl::Status Write(ByteSpan blob) override {
+    if (!PreWriteFlush(blob.size())) return writer_.status();
     if (!writer_.WriteRecord(AsStringView(blob))) return writer_.status();
-    // Riegeli's automatic flushing happens in chunks, not on record boundaries.
-    // Flushing explicitly after every write makes it visible to readers earlier
-    // especially if writes are infrequent and/or the size of records is small
-    // relative to chunk size; however, compression performance suffers with
-    // more frequent flushing.
-    // Writes of large chunks are not atomic. Therefore, frequent flushing can
-    // still leave the file in an invalid state from a partial write which is
-    // accounted for in `DefaultBlobFileReader::Close()` - however, the
-    // likelihood of that is reduced since writes may be smaller.
-    // TODO(b/313706444): Profile tradeoff of read freshness vs compression and
-    // tune parameters accordingly.
-    if (!writer_.Flush()) return writer_.status();
+    if (!PostWriteFlush(blob.size())) [[unlikely]]
+      return writer_.status();
+    VLOG_EVERY_N_SEC(10, 30) << "Current stats: " << StatsString();
     return absl::OkStatus();
   }
 
@@ -286,10 +296,93 @@ class RiegeliWriter : public BlobFileWriter {
   }
 
  private:
+  // TODO(ussuri): Expose as `Options` once Riegeli is the sole blob writer.
+  static constexpr size_t kMaxBufferedBlobs = 1000;
+  static constexpr uint64_t kMaxBufferedBytes = 100L * 1024 * 1024;
+  static constexpr int kCompressionParallelism = 50;
+  static constexpr absl::Duration kFlushInterval = absl::Minutes(5);
+
+  // Riegeli's automatic flushing occurs when it accumulates over
+  // `Options::chunk_size()` of data, not on record boundaries. Our outputs
+  // are continuously consumed by external readers, so we can't tolerate
+  // partially written records at the end of a file. Therefore, we explicitly
+  // flush when we're just about to cross the chunk size boundary, or if the
+  // client writes infrequently, or if the size of records is small relative
+  // to the chunk size. The latter two cases are to make the data visible to
+  // readers earlier; however, note that the compression performance may
+  // suffer.
+  bool PreWriteFlush(size_t blob_size) {
+    if (buffered_blobs_ + 1 > kMaxBufferedBlobs ||
+        buffered_bytes_ + blob_size >= kMaxBufferedBytes ||
+        absl::Now() - flush_time_ > kFlushInterval) {
+      VLOG(10) << "Flushing: " << StatsString();
+      if (!writer_.Flush(riegeli::FlushType::kFromMachine)) return false;
+      flush_time_ = absl::Now();
+      written_blobs_ += buffered_blobs_;
+      written_bytes_ += buffered_bytes_;
+      buffered_blobs_ = 0;
+      buffered_bytes_ = 0;
+    }
+    return true;
+  }
+
+  // In the rare case where the current blob itself exceeds the chunk size,
+  // `Write()` will auto-flush a portion of it to the file, but the remainder
+  // will remain in the buffer, so we need to force-flush it to maintain file
+  // completeness.
+  bool PostWriteFlush(size_t blob_size) {
+    if (blob_size >= kMaxBufferedBytes) {
+      VLOG(10) << "Post-flushing: " << StatsString();
+      if (!writer_.Flush(riegeli::FlushType::kFromMachine)) return false;
+      flush_time_ = absl::Now();
+      written_blobs_ += 1;
+      written_bytes_ += blob_size;
+      buffered_blobs_ = 0;
+      buffered_bytes_ = 0;
+    } else {
+      buffered_blobs_ += 1;
+      buffered_bytes_ += blob_size;
+    }
+    return true;
+  }
+
+  // Returns a debug string with the effective writing rate for the current file
+  // path. The effective rate is measured as a ratio of the total bytes passed
+  // to `Write()` and the elapsed time from the file opening till now.
+  std::string StatsString() const {
+    const auto secs = absl::ToDoubleSeconds(absl::Now() - open_time_);
+    const auto total_bytes = written_bytes_ + buffered_bytes_;
+    const auto throughput =
+        static_cast<uint64_t>(std::ceil(total_bytes / secs));
+    const auto file_size = RemoteFileGetSize(file_path_);
+    const auto compression =
+        file_size > 0 ? (1.0 * written_bytes_ / file_size) : 0;
+    return absl::StrFormat(
+        "committed: %llu blobs / %llu bytes, "
+        "buffered: %llu blobs / %llu bytes / %.1f secs ago, "
+        "throughput: %llu bytes/sec, compression: %.1f, file: %s",
+        written_blobs_, written_bytes_, buffered_blobs_, buffered_bytes_,
+        absl::ToDoubleSeconds(absl::Now() - flush_time_), throughput,
+        compression, file_path_);
+  }
+
   riegeli::RecordWriter<std::unique_ptr<riegeli::Writer>> writer_{
       riegeli::kClosed};
+
+  // Buffering/flushing control.
+  absl::Time flush_time_ = absl::InfiniteFuture();
+  uint64_t buffered_blobs_ = 0;
+  uint64_t buffered_bytes_ = 0;
+
+  // Telemetry.
+  std::string file_path_;
+  absl::Time open_time_ = absl::InfiniteFuture();
+  uint64_t written_blobs_ = 0;
+  uint64_t written_bytes_ = 0;
 };
 #endif  // CENTIPEDE_DISABLE_RIEGELI
+
+}  // namespace
 
 std::unique_ptr<BlobFileReader> DefaultBlobFileReaderFactory() {
   return std::make_unique<DefaultBlobFileReader>();
