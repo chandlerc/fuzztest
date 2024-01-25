@@ -1233,8 +1233,10 @@ cc_test(
     name = "remote_file_test",
     srcs = ["remote_file_test.cc"],
     deps = [
+        ":logging",
         ":remote_file",
         ":test_util",
+        "@com_google_absl//absl/log:check",
         "@com_google_googletest//:gtest_main",
     ],
 )
