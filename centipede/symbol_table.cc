@@ -14,6 +14,7 @@
 
 #include "./centipede/symbol_table.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>  // NOLINT
 #include <fstream>
@@ -21,6 +22,7 @@
 #include <ostream>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "absl/log/check.h"
@@ -35,6 +37,7 @@
 #include "./centipede/control_flow.h"
 #include "./centipede/logging.h"
 #include "./centipede/pc_info.h"
+#include "./centipede/thread_pool.h"
 #include "./centipede/util.h"
 
 namespace centipede {
@@ -73,10 +76,16 @@ void SymbolTable::WriteToLLVMSymbolizer(std::ostream &out) {
 void SymbolTable::GetSymbolsFromOneDso(absl::Span<const PCInfo> pc_infos,
                                        std::string_view dso_path,
                                        std::string_view symbolizer_path,
-                                       std::string_view tmp_path1,
-                                       std::string_view tmp_path2) {
-  auto pcs_path(tmp_path1);
-  auto symbols_path(tmp_path2);
+                                       std::string_view tmp_dir_path,
+                                       size_t unique_id) {
+  std::string first_tmp_name = "symbols_tmp1_";
+  absl::StrAppend(&first_tmp_name, unique_id);
+  std::string second_tmp_name = "symbols_tmp2_";
+  absl::StrAppend(&second_tmp_name, unique_id);
+  ScopedFile sym_tmp1_path(tmp_dir_path, first_tmp_name);
+  ScopedFile sym_tmp2_path(tmp_dir_path, second_tmp_name);
+  auto pcs_path(sym_tmp1_path.path());
+  auto symbols_path(sym_tmp2_path.path());
   // Create the input file (one PC per line).
   std::string pcs_string;
   for (const auto &pc_info : pc_infos) {
@@ -117,8 +126,7 @@ void SymbolTable::GetSymbolsFromOneDso(absl::Span<const PCInfo> pc_infos,
 void SymbolTable::GetSymbolsFromBinary(const PCTable &pc_table,
                                        const DsoTable &dso_table,
                                        std::string_view symbolizer_path,
-                                       std::string_view tmp_path1,
-                                       std::string_view tmp_path2) {
+                                       std::string_view tmp_dir_path) {
   // NOTE: --symbolizer_path=/dev/null is a somewhat expected alternative to
   // "" that users might pass.
   if (symbolizer_path.empty() || symbolizer_path == "/dev/null") {
@@ -130,15 +138,34 @@ void SymbolTable::GetSymbolsFromBinary(const PCTable &pc_table,
   LOG(INFO) << "Symbolizing " << dso_table.size() << " instrumented DSOs";
 
   // Iterate all DSOs, symbolize their respective PCs.
+  // Symbolizing the PCs can take time, so we
+  // record them in parallel into separate symbol tables,
+  // and later merge.
+  std::vector<SymbolTable> symbol_tables(dso_table.size());
   size_t pc_idx_begin = 0;
-  for (const auto &dso_info : dso_table) {
-    CHECK_LE(pc_idx_begin + dso_info.num_instrumented_pcs, pc_table.size())
-        << VV(pc_idx_begin) << VV(dso_info.num_instrumented_pcs);
-    const absl::Span<const PCInfo> pc_infos = {pc_table.data() + pc_idx_begin,
-                                               dso_info.num_instrumented_pcs};
-    GetSymbolsFromOneDso(pc_infos, dso_info.path, symbolizer_path, tmp_path1,
-                         tmp_path2);
-    pc_idx_begin += dso_info.num_instrumented_pcs;
+  {
+    // Symbolization is quite IO-bound so we arbitrarily run 30 at once
+    // even if we have few CPUs.
+    size_t num_threads = std::min(dso_table.size(), static_cast<size_t>(30));
+    num_threads = std::max(num_threads, static_cast<size_t>(1));
+    centipede::ThreadPool thread_pool(num_threads);
+    size_t dso_id = 0;
+    for (const auto &dso_info : dso_table) {
+      CHECK_LE(pc_idx_begin + dso_info.num_instrumented_pcs, pc_table.size());
+      const absl::Span<const PCInfo> pc_infos = {pc_table.data() + pc_idx_begin,
+                                                 dso_info.num_instrumented_pcs};
+      auto lambda = [&symbol_tables, pc_infos, &dso_info, symbolizer_path,
+                     tmp_dir_path, dso_id]() {
+        symbol_tables[dso_id].GetSymbolsFromOneDso(
+            pc_infos, dso_info.path, symbolizer_path, tmp_dir_path, dso_id);
+      };
+      thread_pool.Schedule(std::move(lambda));
+      dso_id++;
+      pc_idx_begin += dso_info.num_instrumented_pcs;
+    }
+  }
+  for (const auto &table : symbol_tables) {
+    AddEntries(table);
   }
   CHECK_EQ(pc_idx_begin, pc_table.size());
 
@@ -192,6 +219,12 @@ void SymbolTable::AddEntryInternal(std::string_view func, std::string_view file,
 
 std::string_view SymbolTable::GetOrInsert(std::string_view str) {
   return *table_.insert(std::string{str}).first;
+}
+
+void SymbolTable::AddEntries(const SymbolTable &other) {
+  for (const auto &entry : other.entries_) {
+    AddEntryInternal(entry.func, entry.file, entry.line, entry.col);
+  }
 }
 
 }  // namespace centipede
